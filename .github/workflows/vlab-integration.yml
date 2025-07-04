@@ -1,0 +1,73 @@
+name: Mock VLAB Integration Test
+
+on:
+  pull_request:
+    types: [labeled, opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      test_scenarios:
+        description: 'Comma-separated list of test scenarios'
+        required: false
+        default: 'basic-test'
+
+jobs:
+  check-requirements:
+    runs-on: ubuntu-latest
+    outputs:
+      run_vlab: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'vlab') }}
+      run_release_test: ${{ contains(github.event.pull_request.labels.*.name, 'release-test') }}
+      test_scenarios: ${{ github.event.inputs.test_scenarios || (contains(github.event.pull_request.labels.*.name, 'release-test') && 'basic-test,advanced-test,edge-case-test' || 'basic-test') }}
+    steps:
+      - run: echo "Checking if mock VLAB tests should run"
+      - name: Show PR labels
+        if: github.event_name == 'pull_request'
+        run: echo "PR labels - ${{ toJSON(github.event.pull_request.labels.*.name) }}"
+
+  vlab-integration-test:
+    needs: check-requirements
+    if: needs.check-requirements.outputs.run_vlab == 'true'
+    uses: pau-hedgehog/mock-fabricator/.github/workflows/reusable-vlab.yml@main
+    with:
+      component_name: mock-fabric
+      commit_sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      go_module_path: github.com/pau-hedgehog/mock-fabric
+      test_scenarios: ${{ needs.check-requirements.outputs.test_scenarios }}
+      run_release_test: ${{ needs.check-requirements.outputs.run_release_test == 'true' }}
+    secrets:
+      token: ${{ secrets.CROSS_REPO_PAT }}
+
+  post-results:
+    needs: [check-requirements, vlab-integration-test]
+    if: always() && needs.check-requirements.outputs.run_vlab == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post results comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            
+            const workflowRunResult = '${{ needs.vlab-integration-test.result }}';
+            const isReleaseTest = ${{ needs.check-requirements.outputs.run_release_test == 'true' }};
+            const testScenarios = '${{ needs.check-requirements.outputs.test_scenarios }}'.split(',');
+            
+            let body = `## Mock VLAB Integration Test Results\n\n`;
+            body += `Overall Status: **${workflowRunResult.toUpperCase()}**\n\n`;
+            body += `Scenarios tested: ${testScenarios.join(', ')}\n\n`;
+            body += `[View detailed results](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId})\n\n`;
+            
+            if (isReleaseTest) {
+              body += `Full test suite was executed (triggered by 'release-test' label)\n`;
+            } else {
+              body += `Basic test was executed. Add 'release-test' label for comprehensive testing.\n`;
+            }
+            
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body
+            });
